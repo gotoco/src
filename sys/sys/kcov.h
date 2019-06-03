@@ -39,6 +39,8 @@
 #define KCOV_IOC_SETBUFSIZE	_IOW('K', 1, uint64_t)
 #define KCOV_IOC_ENABLE		_IOW('K', 2, int)
 #define KCOV_IOC_DISABLE	_IO('K', 3)
+#define KCOV_IOC_ENABLE_SUBMOD	_IOW('K', 4, uint64_t)
+#define KCOV_IOC_DISABLE_SUBMOD	_IOW('K', 5, uint64_t)
 
 #define KCOV_MODE_NONE		0
 #define KCOV_MODE_TRACE_PC	1
@@ -46,5 +48,40 @@
 
 typedef volatile uint64_t kcov_int_t;
 #define KCOV_ENTRY_SIZE sizeof(kcov_int_t)
+
+typedef struct kcov_desc kcov_t;
+
+/* KCOV API for submodules */
+typedef struct kcov_module {
+	/* Describe what tracing mode is supported via module */
+	int supported_mode;
+	/* Module Name */
+	const char * mod_name;
+	/* Module ID (md5 from name) */
+	uint64_t mod_id;
+	/* If submodule is enabled? */
+	int enabled;
+	/* Any additional actions that needs to be done before enablining the mod */
+	int (*register_module) (struct kcov_module *);
+	/* Cleanup after registration */
+	int (*unregister_module) (struct kcov_module *);
+	/* After enabling the module the handler for trace can be run anytime */
+	int (*enable_module) (kcov_t *kd, void *kcov_ctx);
+	/* After Disabling module trace handlers wont be called anymore */
+	int (*disable_module) (kcov_t *kd, void *kcov_ctx);
+	/* Handlers for tracing */
+	// TODO: wrap type,arg1,arg2,pc into structure
+	void (*h_cmptrace) (kcov_int_t const *buf, uint64_t idx, uint64_t type,
+			  uint64_t arg1, uint64_t arg2, intptr_t pc, void *ctx);
+	void (*h_pctrace) (kcov_int_t const *buf, uint64_t idx, void *ctx);
+	/* Module private data */
+	void *ctx;
+} kcov_module_t;
+
+/* Register kcov module */
+int kcov_register_module(kcov_module_t *mod, uint64_t *id);
+
+/* Unregister kcov module */
+int kcov_unregister_module(uint64_t id);
 
 #endif /* !_SYS_KCOV_H_ */
