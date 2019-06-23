@@ -136,7 +136,7 @@ typedef struct kcov_modules {
 
 static kmutex_t modules_lock;
 
-static kcov_modules_t kcov_modules = {
+static kcov_modules_t kcov_mod_head = {
 	0,
 	NULL,
 	NULL,
@@ -145,15 +145,15 @@ static kcov_modules_t kcov_modules = {
 int
 kcov_register_module(kcov_module_t *km, uint64_t *id)
 {
-	static kcov_modules_t *kp;
+	kcov_modules_t *kp;
 
 	mutex_enter(&modules_lock);
 
-	kp = &kcov_modules;
+	kp = &kcov_mod_head;
 	while (kp->next != NULL)
 		kp = kp->next;
 
-	kp->next = kmem_zalloc(sizeof(kcov_modules), KM_SLEEP);
+	kp->next = kmem_zalloc(sizeof(*kp), KM_SLEEP);
 	kp->next->id = kp->id+1;
 	kp->next->next = NULL;
 	kp->next->module = km;
@@ -166,6 +166,31 @@ kcov_register_module(kcov_module_t *km, uint64_t *id)
 
 	return 0;
 };
+
+static int
+kcov_find_module_via_id(uint64_t uid, kcov_module_t **km)
+{
+	kcov_modules_t *ptr;
+	uint8_t found = 0;
+
+	ptr = &kcov_mod_head;
+
+	while (ptr != NULL) {
+		if (ptr->id == uid) {
+			found = 1;
+			break;
+		}
+
+		ptr = ptr->next;
+	}
+
+	if (found == 0)
+		return -1;
+
+	*km = ptr->module;
+
+	return 0;
+}
 
 int
 kcov_unregister_module(uint64_t id)
@@ -293,7 +318,7 @@ kcov_fops_close(file_t *fp)
 static int
 kcov_fops_ioctl(file_t *fp, u_long cmd, void *addr)
 {
-// TODO: handle submod via uid	uint64_t uid = 0;
+	uint64_t uid = 0;
 	int error = 0;
 	int mode;
 	kcov_t *kd;
@@ -351,32 +376,46 @@ printf("#: MMPG: IOCTL(1)!: :: %lu \n", cmd);
 		kd->enabled = true;
 		break;
 	case KCOV_IOC_ENABLE_SUBMOD:
-		//kd->submod = 1;
-		// TODO: hack here we should handle modules in generic way
-		// 	also this operation should be done before (kd->enabled)
-		// 	other wise bad things can happen
-		// 	if (kd->enabled)
-		// 		return EBUSY;
-		// 	mod_id = *((int *)addr);
-		// 	kcov_submodule_enable(mod_id);
-		if (kd->submod->enabled) {
+		/* Module needs to be enabled BEFORE tracing */
+		if (kd->enabled) {
 			error = EBUSY;
 			break;
 		}
 		if (kd->submod != NULL) {
-// TODO: search list then connect submod	uid = *((uint64_t *)addr);
-			kd->submod->enable_module(kd, kd->submod->ctx);
+			error = EBUSY;
+			break;
+		}
+		if (kd->submod == NULL) {
+			kcov_module_t *mod;
+
+			uid = *((uint64_t *)addr);
+			if (kcov_find_module_via_id(uid, &mod)) {
+				printf("%sModule with id: %lu not found\n",
+					"kcov::", uid);
+				error = EINVAL;
+				break;
+			}
+
+			kd->submod = mod;
+			if (kd->submod->enable_module)
+				kd->submod->enable_module(kd, kd->submod->ctx);
 			// TODO: guard here via mutes similar to kcov way
 			kd->submod->enabled = 1;
 		} else {
+			printf("%sSubmodule already enabled!\n", "kcov::");
 			error = ENOENT;
 		}
 		break;
 	case KCOV_IOC_DISABLE_SUBMOD:
+		/* Module can be dissabled AFTER tracing is done */
+		if (kd->enabled) {
+			error = EBUSY;
+			break;
+		}
 		if (kd->submod != NULL) {
-//			uid = *((uint64_t *)addr);
 			kd->submod->enabled = 0;
 			kd->submod->disable_module(kd, kd->submod->ctx);
+			kd->submod = NULL;
 		}
 		break;
 	// TODO: Here we also need to list modules
@@ -761,7 +800,7 @@ struct afl_softc {
 	uint64_t afl_prev_loc;
 };
 
-static struct afl_softc sc;
+//static struct afl_softc sc;
 
 static const char * afl_mod_name = "afl_module";
 
@@ -783,8 +822,14 @@ static void
 kafl_register(void)
 {
 	struct kcov_module *km;
+	struct afl_softc *sc;
 	uint64_t uid;
+
+	sc = kmem_zalloc(sizeof(*sc), KM_SLEEP);
 	km = kmem_zalloc(sizeof(*km), KM_SLEEP);
+
+	sc->enabled = 0xbadbeef;
+	sc->afl_prev_loc = 0xbadc0ffee;
 
 	km->supported_mode = KCOV_MODE_TRACE_PC;
 	km->mod_name = afl_mod_name;
@@ -794,7 +839,7 @@ kafl_register(void)
 	km->disable_module = &kafl_dissable_module;
 	km->h_cmptrace = NULL;
 	km->h_pctrace = &kafl_handle_pctrace;
-	km->ctx = &sc;
+	km->ctx = sc;
 
 	kcov_register_module(km, &uid);
 
@@ -814,13 +859,9 @@ kafl_handle_pctrace(kcov_int_t const *buf, uint64_t idx, void *kcov_ctx)
 }
 
 static int
-kcov_realloc_aflbuf(struct afl_softc *as, size_t size)
+kcov_alloc_aflbuf(struct afl_softc *as, size_t size)
 {
 	int error;
-
-	if (as->afl_area != NULL) {
-		uvm_deallocate(kernel_map, (vaddr_t)as->afl_area, as->afl_bsize);
-	}
 
 	as->afl_bsize = size;
 	as->afl_uobj = uao_create(as->afl_bsize, 0);
@@ -865,9 +906,12 @@ kafl_enable_module(kcov_t *kd, void *kcov_ctx)
 	as = kcov_ctx;
 	if (as == NULL)
 		return -1;
-	as->enabled = 1;
+
 	as->afl_bsize = KCOV_AFLBUF_SDEFAULT;
-	error = kcov_realloc_aflbuf(as, KCOV_AFLBUF_SDEFAULT);
+	error = kcov_alloc_aflbuf(as, KCOV_AFLBUF_SDEFAULT);
+
+	if (!error)
+		as->enabled = 1;
 
 	return error;
 }
@@ -890,32 +934,32 @@ kafl_dissable_module(kcov_t *kd, void *kcov_ctx)
 static int
 cafl_open(dev_t dev, int flag, int mode, struct lwp *l)
 {
+	struct afl_softc *asc;
 	struct file *fp;
 	int error, fd;
-
-	if (sc.refcnt > 0)
-		return EBUSY;
-
-	++sc.refcnt;
 
 	error = fd_allocfile(&fp, &fd);
 	if (error)
 		return error;
 
-	/** For later
-	sc = kmem_zalloc(sizeof(*sc), KM_SLEEP);
-	mutex_init(&sc->lock, MUTEX_DEFAULT, IPL_NONE);
-	*/
+	asc = kmem_zalloc(sizeof(*asc), KM_SLEEP);
+	// mutex_init(&sc->lock, MUTEX_DEFAULT, IPL_NONE);
 
-	return fd_clone(fp, fd, flag, &cafl_fileops, &sc);
+	return fd_clone(fp, fd, flag, &cafl_fileops, asc);
 }
 
 static int
 afl_fops_close(file_t *fp)
 {
-	--sc.refcnt;
+	struct afl_softc *asc = fp->f_data;
 
-	fp->f_data = NULL;
+// TODO: Double check that, not sure how exactly works:
+	if (!asc->enabled) {
+		fp->f_data = NULL;
+
+		// mutex_destroy(&asc->lock);
+		kmem_free(asc, sizeof(*asc));
+	}
 
    	return 0;
 }
