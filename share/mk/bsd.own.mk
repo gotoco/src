@@ -1157,7 +1157,7 @@ EXTERNAL_MESALIB_DIR?=	MesaLib
 .endif
 
 # Default to LLVM run-time if x86 and X11 and Mesa 18
-.if ${MKX11} != "no" && ${HAVE_MESA_VER} == "18"
+.if ${MKX11:Uno} != "no" && ${HAVE_MESA_VER} == "18"
 MKLLVMRT.amd64=		yes
 MKLLVMRT.i386=		yes
 .endif

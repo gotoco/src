@@ -48,7 +48,15 @@
 #include <uvm/uvm_extern.h>
 #include <sys/kcov.h>
 
-#define KCOV_BUF_MAX_ENTRIES	(256 << 10)
+/* For some tracing modes KCOV size needs to handle large stack/branch traces
+ * use max value 512 MB
+ */
+#define KCOV_BUF_MAX_ENTRIES	(1 << 29)
+
+/* AFL widely uses 64kB buffer for storing branch hits
+ * KCOV will expose by default same size buffer ready to use
+ * Size of buffer can be changed via KCOV_IOC_CHANGEAFLBUF IOCTL */
+#define KCOV_AFLBUF_SDEFAULT	(1 << 16)
 
 #define KCOV_CMP_CONST		1
 #define KCOV_CMP_SIZE(x)	((x) << 1)
@@ -105,17 +113,91 @@ const struct fileops kcov_fileops = {
  */
 
 typedef struct kcov_desc {
-	kmutex_t lock;
 	kcov_int_t *buf;
+	size_t bufsize;
 	struct uvm_object *uobj;
 	size_t bufnent;
-	size_t bufsize;
 	int mode;
-	bool enabled;
-	bool lwpfree;
+	kmutex_t lock;
+	uint8_t enabled : 1;
+	uint8_t lwpfree : 1;
+	kcov_module_t *submod;
 } kcov_t;
 
 static specificdata_key_t kcov_lwp_key;
+
+typedef struct kcov_modules kcov_modules_t;
+
+typedef struct kcov_modules {
+	uint64_t id;
+	kcov_modules_t *next;
+	kcov_module_t *module;
+} kcov_modules_t;
+
+static kmutex_t modules_lock;
+
+static kcov_modules_t kcov_mod_head = {
+	0,
+	NULL,
+	NULL,
+};
+
+int
+kcov_register_module(kcov_module_t *km, uint64_t *id)
+{
+	kcov_modules_t *kp;
+
+	mutex_enter(&modules_lock);
+
+	kp = &kcov_mod_head;
+	while (kp->next != NULL)
+		kp = kp->next;
+
+	kp->next = kmem_zalloc(sizeof(*kp), KM_SLEEP);
+	kp->next->id = kp->id+1;
+	kp->next->next = NULL;
+	kp->next->module = km;
+
+	if (km->register_module != NULL)
+		km->register_module(km);
+	*id = kp->id+1;
+
+	mutex_exit(&modules_lock);
+
+	return 0;
+};
+
+static int
+kcov_find_module_via_id(uint64_t uid, kcov_module_t **km)
+{
+	kcov_modules_t *ptr;
+	uint8_t found = 0;
+
+	ptr = &kcov_mod_head;
+
+	while (ptr != NULL) {
+		if (ptr->id == uid) {
+			found = 1;
+			break;
+		}
+
+		ptr = ptr->next;
+	}
+
+	if (found == 0)
+		return -1;
+
+	*km = ptr->module;
+
+	return 0;
+}
+
+int
+kcov_unregister_module(uint64_t id)
+{
+	// TODO:: implement me
+	return 0;
+};
 
 static void
 kcov_lock(kcov_t *kd)
@@ -139,6 +221,7 @@ kcov_free(kcov_t *kd)
 	if (kd->buf != NULL) {
 		uvm_deallocate(kernel_map, (vaddr_t)kd->buf, kd->bufsize);
 	}
+
 	mutex_destroy(&kd->lock);
 	kmem_free(kd, sizeof(*kd));
 }
@@ -152,7 +235,7 @@ kcov_lwp_free(void *arg)
 		return;
 	}
 	kcov_lock(kd);
-	kd->enabled = false;
+	kd->enabled = 0;
 	kcov_unlock(kd);
 	if (kd->lwpfree) {
 		kcov_free(kd);
@@ -194,6 +277,7 @@ kcov_allocbuf(kcov_t *kd, uint64_t nent)
 	return 0;
 }
 
+
 /* -------------------------------------------------------------------------- */
 
 static int
@@ -234,6 +318,7 @@ kcov_fops_close(file_t *fp)
 static int
 kcov_fops_ioctl(file_t *fp, u_long cmd, void *addr)
 {
+	uint64_t uid = 0;
 	int error = 0;
 	int mode;
 	kcov_t *kd;
@@ -242,7 +327,7 @@ kcov_fops_ioctl(file_t *fp, u_long cmd, void *addr)
 	if (kd == NULL)
 		return ENXIO;
 	kcov_lock(kd);
-
+printf("#: MMPG: IOCTL(1)!: :: %lu \n", cmd);
 	switch (cmd) {
 	case KCOV_IOC_SETBUFSIZE:
 		if (kd->enabled) {
@@ -251,6 +336,14 @@ kcov_fops_ioctl(file_t *fp, u_long cmd, void *addr)
 		}
 		error = kcov_allocbuf(kd, *((uint64_t *)addr));
 		break;
+// Move to AFL fd
+//	case KCOV_IOC_CHANGEAFLBUF:
+//		if (kd->enabled) {
+//			error = EBUSY;
+//			break;
+//		}
+//		error = kcov_realloc_aflbuf(kd, *((uint64_t *)addr));
+//		break;
 	case KCOV_IOC_ENABLE:
 		if (kd->enabled) {
 			error = EBUSY;
@@ -273,6 +366,7 @@ kcov_fops_ioctl(file_t *fp, u_long cmd, void *addr)
 			kd->mode = mode;
 			break;
 		default:
+			printf("#: MMPG : default#EINVAL\n");
 			error = EINVAL;
 		}
 		if (error)
@@ -281,6 +375,50 @@ kcov_fops_ioctl(file_t *fp, u_long cmd, void *addr)
 		lwp_setspecific(kcov_lwp_key, kd);
 		kd->enabled = true;
 		break;
+	case KCOV_IOC_ENABLE_SUBMOD:
+		/* Module needs to be enabled BEFORE tracing */
+		if (kd->enabled) {
+			error = EBUSY;
+			break;
+		}
+		if (kd->submod != NULL) {
+			error = EBUSY;
+			break;
+		}
+		if (kd->submod == NULL) {
+			kcov_module_t *mod;
+
+			uid = *((uint64_t *)addr);
+			if (kcov_find_module_via_id(uid, &mod)) {
+				printf("%sModule with id: %lu not found\n",
+					"kcov::", uid);
+				error = EINVAL;
+				break;
+			}
+
+			kd->submod = mod;
+			if (kd->submod->enable_module)
+				kd->submod->enable_module(kd, kd->submod->ctx);
+			// TODO: guard here via mutes similar to kcov way
+			kd->submod->enabled = 1;
+		} else {
+			printf("%sSubmodule already enabled!\n", "kcov::");
+			error = ENOENT;
+		}
+		break;
+	case KCOV_IOC_DISABLE_SUBMOD:
+		/* Module can be dissabled AFTER tracing is done */
+		if (kd->enabled) {
+			error = EBUSY;
+			break;
+		}
+		if (kd->submod != NULL) {
+			kd->submod->enabled = 0;
+			kd->submod->disable_module(kd, kd->submod->ctx);
+			kd->submod = NULL;
+		}
+		break;
+	// TODO: Here we also need to list modules
 	case KCOV_IOC_DISABLE:
 		if (!kd->enabled) {
 			error = ENOENT;
@@ -294,6 +432,7 @@ kcov_fops_ioctl(file_t *fp, u_long cmd, void *addr)
 		kd->enabled = false;
 		break;
 	default:
+		printf("#: MMPG : 2default#EINVAL\n");
 		error = EINVAL;
 	}
 
@@ -379,12 +518,20 @@ __sanitizer_cov_trace_pc(void)
 		/* PC tracing mode not enabled */
 		return;
 	}
-
+	//TODO: it would be nice for perf to store buf, bufnent and afl_area
+	//	inside current task, however it will require few changes.
 	idx = kd->buf[0];
-	if (idx < kd->bufnent) {
+	if (__predict_true(idx < kd->bufnent)) {
 		kd->buf[idx+1] =
 		    (intptr_t)__builtin_return_address(0);
 		kd->buf[0] = idx + 1;
+		//TODO: Here we dont need as many checks just for API development
+		if (kd->submod != NULL &&
+		    kd->submod->enabled == 1 &&
+		    kd->submod->supported_mode == KCOV_MODE_TRACE_PC &&
+		    kd->submod->h_pctrace != NULL) {
+			kd->submod->h_pctrace(kd->buf, idx, kd->submod->ctx);
+		}
 	}
 }
 
@@ -428,6 +575,13 @@ trace_cmp(uint64_t type, uint64_t arg1, uint64_t arg2, intptr_t pc)
 		kd->buf[idx * 4 + 3] = arg2;
 		kd->buf[idx * 4 + 4] = pc;
 		kd->buf[0] = idx + 1;
+	}
+	if (kd->submod != NULL &&
+	    kd->submod->enabled == 1 &&
+	    kd->submod->supported_mode == KCOV_MODE_TRACE_CMP &&
+	    kd->submod->h_cmptrace != NULL) {
+		kd->submod->h_cmptrace(kd->buf, idx, type, arg1, arg2, pc,
+						kd->submod->ctx);
 	}
 }
 
@@ -549,11 +703,26 @@ __sanitizer_cov_trace_switch(uint64_t val, uint64_t *cases)
 
 MODULE(MODULE_CLASS_MISC, kcov, NULL);
 
+static void kafl_register(void);
+
 static void
 kcov_init(void)
 {
 
 	lwp_specific_key_create(&kcov_lwp_key, kcov_lwp_free);
+
+	mutex_init(&modules_lock, MUTEX_DEFAULT, IPL_NONE);
+	// Dirty hack for the while. Register AFL submodule
+	kafl_register();
+}
+
+static void
+kcov_deinit(void)
+{
+	// Dirty hack for the while. Un-register AFL submodule
+	// kcov_unregister_submodule();
+	// TODO: CLEAR all modules before that
+	mutex_destroy(&modules_lock);
 }
 
 static int
@@ -565,8 +734,271 @@ kcov_modcmd(modcmd_t cmd, void *arg)
 		kcov_init();
 		return 0;
 	case MODULE_CMD_FINI:
+		kcov_deinit();
 		return EINVAL;
 	default:
 		return ENOTTY;
 	}
 }
+
+/* -------------------------- COV SUBMODULES --------------------------- */
+/* I would like to have it inside CPU hash, currently amd64 like */
+/* Chuck Lever described efficiency of this technique:
+ * http://www.citi.umich.edu/techreports/reports/citi-tr-00-1.pdf */
+#define GOLDEN_RATIO_32 0x61C88647
+#define GOLDEN_RATIO_64 0x61C8864680B583EBull
+#define BITS_PER_LONG 	64
+
+static uint64_t
+_long_hash64(uint64_t val, unsigned int bits) {
+	return val * GOLDEN_RATIO_64 >> (64 - bits);
+}
+
+static int cafl_open(dev_t dev, int flag, int mode, struct lwp *l);
+
+dev_type_open(cafl_open);
+
+static struct cdevsw cafl_cdevsw = {
+	.d_open = cafl_open,
+	.d_close = noclose,
+	.d_read = noread,
+	.d_write = nowrite,
+	.d_ioctl = noioctl,
+	.d_stop = nostop,
+	.d_tty = notty,
+	.d_poll = nopoll,
+	.d_mmap = nommap,
+	.d_kqfilter = nokqfilter,
+	.d_discard = nodiscard,
+	.d_flag = D_OTHER | D_MPSAFE
+};
+
+static int afl_fops_close(file_t *fp);
+
+static int afl_fops_mmap(file_t *, off_t *, size_t, int, int *, int *,
+			 struct uvm_object **, int *);
+
+const struct fileops cafl_fileops = {
+	.fo_read = fbadop_read,
+	.fo_write = fbadop_write,
+	.fo_ioctl = fbadop_ioctl,
+	.fo_fcntl = fnullop_fcntl,
+	.fo_poll = fnullop_poll,
+	.fo_stat = fbadop_stat,
+	.fo_close = afl_fops_close,
+	.fo_kqfilter = fnullop_kqfilter,
+	.fo_restart = fnullop_restart,
+	.fo_mmap = afl_fops_mmap,
+};
+
+struct afl_softc {
+	int enabled;
+	int refcnt;
+	kcov_int_t *afl_area;
+	size_t afl_bsize;
+	struct uvm_object *afl_uobj;
+	uint64_t afl_prev_loc;
+};
+
+//static struct afl_softc sc;
+
+static const char * afl_mod_name = "afl_module";
+
+static int kafl_enable_module(kcov_t *kd, void *kcov_ctx);
+static int kafl_dissable_module(kcov_t *kd, void *kcov_ctx);
+static void
+kafl_handle_pctrace(kcov_int_t const *buf, uint64_t idx, void *kcov_ctx);
+
+static int
+kafl_unregister_module(struct kcov_module *mod)
+{
+	devsw_detach(NULL, &cafl_cdevsw);
+
+	return 0;
+}
+
+// TODO: This assignment should be done inside kcov framework
+static void
+kafl_register(void)
+{
+	struct kcov_module *km;
+	struct afl_softc *sc;
+	uint64_t uid;
+
+	sc = kmem_zalloc(sizeof(*sc), KM_SLEEP);
+	km = kmem_zalloc(sizeof(*km), KM_SLEEP);
+
+	sc->enabled = 0xbadbeef;
+	sc->afl_prev_loc = 0xbadc0ffee;
+
+	km->supported_mode = KCOV_MODE_TRACE_PC;
+	km->mod_name = afl_mod_name;
+	km->register_module = NULL;
+	km->unregister_module = kafl_unregister_module;
+	km->enable_module = &kafl_enable_module;
+	km->disable_module = &kafl_dissable_module;
+	km->h_cmptrace = NULL;
+	km->h_pctrace = &kafl_handle_pctrace;
+	km->ctx = sc;
+
+	kcov_register_module(km, &uid);
+
+	int cmajor = 354, bmajor = -1;
+
+	devsw_attach("afl", NULL, &bmajor, &cafl_cdevsw, &cmajor);
+
+}
+
+static void
+kafl_handle_pctrace(kcov_int_t const *buf, uint64_t idx, void *kcov_ctx)
+{
+	struct afl_softc *asc = kcov_ctx;
+
+	++asc->afl_area[(asc->afl_prev_loc ^ buf[idx]) & BITS_PER_LONG];
+	asc->afl_prev_loc = _long_hash64(buf[idx], BITS_PER_LONG);
+}
+
+static int
+kcov_alloc_aflbuf(struct afl_softc *as, size_t size)
+{
+	int error;
+
+	as->afl_bsize = size;
+	as->afl_uobj = uao_create(as->afl_bsize, 0);
+	as->afl_area = NULL;
+
+	error = uvm_map(kernel_map, (vaddr_t *)&as->afl_area, as->afl_bsize,
+			as->afl_uobj, 0, 0, UVM_MAPFLAG(UVM_PROT_RW, UVM_PROT_RW,
+			UVM_INH_SHARE, UVM_ADV_RANDOM, 0));
+	if (error) {
+		uao_detach(as->afl_uobj);
+		return error;
+	}
+	error = uvm_map_pageable(kernel_map, (vaddr_t)as->afl_area,
+	    (vaddr_t)as->afl_area + size, false, 0);
+
+	if (error) {
+		uvm_deallocate(kernel_map, (vaddr_t)as->afl_area, size);
+		return error;
+	}
+
+	return 0;
+}
+
+static int
+kcov_dealloc_aflbuf(struct afl_softc *as)
+{
+	uvm_deallocate(kernel_map, (vaddr_t)as->afl_area, KCOV_AFLBUF_SDEFAULT);
+
+	uao_detach(as->afl_uobj);
+
+	uvm_deallocate(kernel_map, (vaddr_t)as->afl_area, as->afl_bsize);
+
+	return 0;
+}
+
+static int
+kafl_enable_module(kcov_t *kd, void *kcov_ctx)
+{
+	struct afl_softc *as;
+	int error;
+
+	as = kcov_ctx;
+	if (as == NULL)
+		return -1;
+
+	as->afl_bsize = KCOV_AFLBUF_SDEFAULT;
+	error = kcov_alloc_aflbuf(as, KCOV_AFLBUF_SDEFAULT);
+
+	if (!error)
+		as->enabled = 1;
+
+	return error;
+}
+
+static int
+kafl_dissable_module(kcov_t *kd, void *kcov_ctx)
+{
+	struct afl_softc *as;
+
+	as = kcov_ctx;
+	if (as == NULL)
+		return -1;
+
+	as->enabled = 0;
+	kcov_dealloc_aflbuf(as);
+
+	return 0;
+}
+
+static int
+cafl_open(dev_t dev, int flag, int mode, struct lwp *l)
+{
+	struct afl_softc *asc;
+	struct file *fp;
+	int error, fd;
+
+	error = fd_allocfile(&fp, &fd);
+	if (error)
+		return error;
+
+	asc = kmem_zalloc(sizeof(*asc), KM_SLEEP);
+	// mutex_init(&sc->lock, MUTEX_DEFAULT, IPL_NONE);
+
+	return fd_clone(fp, fd, flag, &cafl_fileops, asc);
+}
+
+static int
+afl_fops_close(file_t *fp)
+{
+	struct afl_softc *asc = fp->f_data;
+
+// TODO: Double check that, not sure how exactly works:
+	if (!asc->enabled) {
+		fp->f_data = NULL;
+
+		// mutex_destroy(&asc->lock);
+		kmem_free(asc, sizeof(*asc));
+	}
+
+   	return 0;
+}
+
+static int
+afl_fops_mmap(file_t *fp, off_t *offp, size_t size, int prot, int *flagsp,
+    int *advicep, struct uvm_object **uobjp, int *maxprotp)
+{
+	struct afl_softc *afls;
+	off_t off = *offp;
+	int error = 0;
+
+	if (prot & PROT_EXEC)
+		return EACCES;
+	if (off < 0)
+		return EINVAL;
+
+	afls = fp->f_data;
+	if (afls == NULL)
+		return ENXIO;
+	// TODO: Double check if it rather should be `off >= asd->afl_bsize`
+	if (size > afls->afl_bsize || off > afls->afl_bsize )
+		return EINVAL;
+
+	// Do Locking kafl_lock(kd);
+
+	if ((size + off) > afls->afl_bsize) {
+		error = ENOMEM;
+		goto out;
+	}
+
+	uao_reference(afls->afl_uobj);
+
+	*uobjp = afls->afl_uobj;
+	*maxprotp = prot;
+	*advicep = UVM_ADV_RANDOM;
+
+out:
+	// TODO: locking kafl_unlock(kd);
+	return error;
+}
+
