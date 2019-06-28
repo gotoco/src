@@ -36,6 +36,7 @@
 #include <sys/systm.h>
 #include <sys/kernel.h>
 
+#include <sys/atomic.h>
 #include <sys/conf.h>
 #include <sys/condvar.h>
 #include <sys/file.h>
@@ -47,6 +48,24 @@
 
 #include <uvm/uvm_extern.h>
 #include <sys/kcov.h>
+
+volatile unsigned int opened_fds;
+
+static struct kcov_ops *ops;
+
+#define KCOV_OPEN() (ops->open)()
+#define KCOV_FREE(k) (ops->free)(k)
+#define KCOV_SETBUFSIZE(k, nent) (ops->setbufsize)(k, nent)
+#define KCOV_ENABLE(k, mode) (ops->enable)(k, mode)
+#define KCOV_DISABLE(k) (ops->disable)(k)
+#define KCOV_MMAP(k, size, off, uobjp) (ops->mmap)(k, size, off, uobjp)
+#define KCOV_COV_TRACE_PC(k, pc) (ops->cov_trace_pc)(k, pc)
+#define KCOV_COV_TRACE_CMP(k, t, a, b, pc) (ops->cov_trace_cmp)(k, t, a, b, pc)
+
+/*
+ * KCOV RAW, the default mode with full trace.
+ */
+static struct kcov_ops kcov_raw_ops;
 
 #define KCOV_BUF_MAX_ENTRIES	(256 << 10)
 
@@ -106,11 +125,7 @@ const struct fileops kcov_fileops = {
 
 typedef struct kcov_desc {
 	kmutex_t lock;
-	kcov_int_t *buf;
-	struct uvm_object *uobj;
-	size_t bufnent;
-	size_t bufsize;
-	int mode;
+	void *priv;
 	bool enabled;
 	bool lwpfree;
 } kcov_t;
@@ -136,10 +151,8 @@ kcov_free(kcov_t *kd)
 {
 
 	KASSERT(kd != NULL);
-	if (kd->buf != NULL) {
-		uvm_deallocate(kernel_map, (vaddr_t)kd->buf, kd->bufsize);
-	}
 	mutex_destroy(&kd->lock);
+	KCOV_FREE(kd->priv);
 	kmem_free(kd, sizeof(*kd));
 }
 
@@ -159,41 +172,6 @@ kcov_lwp_free(void *arg)
 	}
 }
 
-static int
-kcov_allocbuf(kcov_t *kd, uint64_t nent)
-{
-	size_t size;
-	int error;
-
-	if (nent < 2 || nent > KCOV_BUF_MAX_ENTRIES)
-		return EINVAL;
-	if (kd->buf != NULL)
-		return EEXIST;
-
-	size = roundup(nent * KCOV_ENTRY_SIZE, PAGE_SIZE);
-	kd->bufnent = nent - 1;
-	kd->bufsize = size;
-	kd->uobj = uao_create(kd->bufsize, 0);
-
-	/* Map the uobj into the kernel address space, as wired. */
-	kd->buf = NULL;
-	error = uvm_map(kernel_map, (vaddr_t *)&kd->buf, kd->bufsize, kd->uobj,
-	    0, 0, UVM_MAPFLAG(UVM_PROT_RW, UVM_PROT_RW, UVM_INH_SHARE,
-	    UVM_ADV_RANDOM, 0));
-	if (error) {
-		uao_detach(kd->uobj);
-		return error;
-	}
-	error = uvm_map_pageable(kernel_map, (vaddr_t)kd->buf,
-	    (vaddr_t)kd->buf + size, false, 0);
-	if (error) {
-		uvm_deallocate(kernel_map, (vaddr_t)kd->buf, size);
-		return error;
-	}
-
-	return 0;
-}
-
 /* -------------------------------------------------------------------------- */
 
 static int
@@ -203,12 +181,18 @@ kcov_open(dev_t dev, int flag, int mode, struct lwp *l)
 	int error, fd;
 	kcov_t *kd;
 
+	atomic_inc_uint(&opened_fds);
+
 	error = fd_allocfile(&fp, &fd);
-	if (error)
+	if (error) {
+		atomic_dec_uint(&opened_fds);
 		return error;
+	}
 
 	kd = kmem_zalloc(sizeof(*kd), KM_SLEEP);
 	mutex_init(&kd->lock, MUTEX_DEFAULT, IPL_NONE);
+
+	kd->priv = KCOV_OPEN();
 
 	return fd_clone(fp, fd, flag, &kcov_fileops, kd);
 }
@@ -228,6 +212,8 @@ kcov_fops_close(file_t *fp)
 	}
 	fp->f_data = NULL;
 
+	atomic_dec_uint(&opened_fds);
+
    	return 0;
 }
 
@@ -235,7 +221,6 @@ static int
 kcov_fops_ioctl(file_t *fp, u_long cmd, void *addr)
 {
 	int error = 0;
-	int mode;
 	kcov_t *kd;
 
 	kd = fp->f_data;
@@ -249,7 +234,7 @@ kcov_fops_ioctl(file_t *fp, u_long cmd, void *addr)
 			error = EBUSY;
 			break;
 		}
-		error = kcov_allocbuf(kd, *((uint64_t *)addr));
+		error = KCOV_SETBUFSIZE(kd->priv, *((uint64_t *)addr));
 		break;
 	case KCOV_IOC_ENABLE:
 		if (kd->enabled) {
@@ -260,21 +245,8 @@ kcov_fops_ioctl(file_t *fp, u_long cmd, void *addr)
 			error = EBUSY;
 			break;
 		}
-		if (kd->buf == NULL) {
-			error = ENOBUFS;
-			break;
-		}
 
-		mode = *((int *)addr);
-		switch (mode) {
-		case KCOV_MODE_NONE:
-		case KCOV_MODE_TRACE_PC:
-		case KCOV_MODE_TRACE_CMP:
-			kd->mode = mode;
-			break;
-		default:
-			error = EINVAL;
-		}
+		error = KCOV_ENABLE(kd->priv, *((int *)addr));
 		if (error)
 			break;
 
@@ -290,6 +262,11 @@ kcov_fops_ioctl(file_t *fp, u_long cmd, void *addr)
 			error = ENOENT;
 			break;
 		}
+
+		error = KCOV_DISABLE(kd->priv);
+		if (error)
+			break;
+
 		lwp_setspecific(kcov_lwp_key, NULL);
 		kd->enabled = false;
 		break;
@@ -323,14 +300,10 @@ kcov_fops_mmap(file_t *fp, off_t *offp, size_t size, int prot, int *flagsp,
 		return ENXIO;
 	kcov_lock(kd);
 
-	if ((size + off) > kd->bufsize) {
-		error = ENOMEM;
+	error = KCOV_MMAP(kd->priv, size, off, uobjp);
+	if (error)
 		goto out;
-	}
 
-	uao_reference(kd->uobj);
-
-	*uobjp = kd->uobj;
 	*maxprotp = prot;
 	*advicep = UVM_ADV_RANDOM;
 
@@ -351,7 +324,6 @@ void
 __sanitizer_cov_trace_pc(void)
 {
 	extern int cold;
-	uint64_t idx;
 	kcov_t *kd;
 
 	if (__predict_false(cold)) {
@@ -375,24 +347,13 @@ __sanitizer_cov_trace_pc(void)
 		return;
 	}
 
-	if (kd->mode != KCOV_MODE_TRACE_PC) {
-		/* PC tracing mode not enabled */
-		return;
-	}
-
-	idx = kd->buf[0];
-	if (idx < kd->bufnent) {
-		kd->buf[idx+1] =
-		    (intptr_t)__builtin_return_address(0);
-		kd->buf[0] = idx + 1;
-	}
+	KCOV_COV_TRACE_PC(kd->priv, (intptr_t)__builtin_return_address(0));
 }
 
 static void
 trace_cmp(uint64_t type, uint64_t arg1, uint64_t arg2, intptr_t pc)
 {
 	extern int cold;
-	uint64_t idx;
 	kcov_t *kd;
 
 	if (__predict_false(cold)) {
@@ -416,19 +377,7 @@ trace_cmp(uint64_t type, uint64_t arg1, uint64_t arg2, intptr_t pc)
 		return;
 	}
 
-	if (kd->mode != KCOV_MODE_TRACE_CMP) {
-		/* CMP tracing mode not enabled */
-		return;
-	}
-
-	idx = kd->buf[0];
-	if ((idx * 4 + 4) <= kd->bufnent) {
-		kd->buf[idx * 4 + 1] = type;
-		kd->buf[idx * 4 + 2] = arg1;
-		kd->buf[idx * 4 + 3] = arg2;
-		kd->buf[idx * 4 + 4] = pc;
-		kd->buf[0] = idx + 1;
-	}
+	KCOV_COV_TRACE_CMP(kd->priv, type, arg1, arg2, pc);
 }
 
 void __sanitizer_cov_trace_cmp1(uint8_t arg1, uint8_t arg2);
@@ -554,6 +503,8 @@ kcov_init(void)
 {
 
 	lwp_specific_key_create(&kcov_lwp_key, kcov_lwp_free);
+
+	ops = &kcov_raw_ops;
 }
 
 static int
@@ -570,3 +521,211 @@ kcov_modcmd(modcmd_t cmd, void *arg)
 		return ENOTTY;
 	}
 }
+
+int
+kcov_ops_set(struct kcov_ops *o)
+{
+
+	KASSERT(o);
+	KASSERT(o->free);
+	KASSERT(o->setbufsize);
+	KASSERT(o->enable);
+	KASSERT(o->disable);
+	KASSERT(o->mmap);
+	KASSERT(o->cov_trace_pc);
+	KASSERT(o->cov_trace_cmp);
+
+	if (opened_fds > 0)
+		return EBUSY;
+
+	ops = o;
+
+	return 0;
+}
+
+int
+kcov_ops_unset(struct kcov_ops *o)
+{
+
+	KASSERT(o);
+
+	if (opened_fds > 0)
+		return EBUSY;
+
+	/* Only allow to detach self */
+	if (ops != o)
+		return EINVAL;
+
+	ops = &kcov_raw_ops;
+
+	return 0;
+}
+
+/* -------------------------------------------------------------------------- */
+
+typedef struct kcov_desc_raw {
+	kcov_int_t *buf;
+	struct uvm_object *uobj;
+	size_t bufnent;
+	size_t bufsize;
+	int mode;
+} kcov_raw_t;
+
+static void *
+kcov_raw_open(void)
+{
+
+	return kmem_zalloc(sizeof(kcov_raw_t), KM_SLEEP);
+}
+
+static void
+kcov_raw_free(void *priv)
+{
+	kcov_raw_t *raw;
+
+	raw = (kcov_raw_t *)priv;
+
+	if (raw->buf != NULL) {
+		uvm_deallocate(kernel_map, (vaddr_t)raw->buf, raw->bufsize);
+	}
+
+	kmem_free(raw, sizeof(*raw));
+}
+
+static int
+kcov_raw_setbufsize(void *priv, uint64_t nent)
+{
+	kcov_raw_t *raw;
+	size_t size;
+	int error;
+
+	raw = (kcov_raw_t *)priv;
+
+	if (nent < 2 || nent > KCOV_BUF_MAX_ENTRIES)
+		return EINVAL;
+	if (raw->buf != NULL)
+		return EEXIST;
+
+	size = roundup(nent * KCOV_ENTRY_SIZE, PAGE_SIZE);
+	raw->bufnent = nent - 1;
+	raw->bufsize = size;
+	raw->uobj = uao_create(raw->bufsize, 0);
+
+	/* Map the uobj into the kernel address space, as wired. */
+	raw->buf = NULL;
+	error = uvm_map(kernel_map, (vaddr_t *)&raw->buf, raw->bufsize,
+	    raw->uobj, 0, 0, UVM_MAPFLAG(UVM_PROT_RW, UVM_PROT_RW,
+	    UVM_INH_SHARE, UVM_ADV_RANDOM, 0));
+	if (error) {
+		uao_detach(raw->uobj);
+		return error;
+	}
+	error = uvm_map_pageable(kernel_map, (vaddr_t)raw->buf,
+	    (vaddr_t)raw->buf + size, false, 0);
+	if (error) {
+		uvm_deallocate(kernel_map, (vaddr_t)raw->buf, size);
+		return error;
+	}
+
+	return 0;
+}
+
+static int
+kcov_raw_enable(void *priv, int mode)
+{
+	kcov_raw_t *raw;
+
+	raw = (kcov_raw_t *)priv;
+
+	if (raw->buf == NULL)
+		return ENOBUFS;
+
+	switch (mode) {
+	case KCOV_MODE_NONE:
+	case KCOV_MODE_TRACE_PC:
+	case KCOV_MODE_TRACE_CMP:
+		raw->mode = mode;
+		return 0;
+	default:
+		return EINVAL;
+	}
+}
+
+static int
+kcov_raw_disable(void *priv __unused)
+{
+
+	return 0;
+}
+
+static int
+kcov_raw_mmap(void *priv, size_t size, off_t off, struct uvm_object **uobjp)
+{
+	kcov_raw_t *raw;
+
+	raw = (kcov_raw_t *)priv;
+
+	if ((size + off) > raw->bufsize)
+		return ENOMEM;
+
+	uao_reference(raw->uobj);
+
+	*uobjp = raw->uobj;
+
+	return 0;
+}
+
+static void
+kcov_raw_cov_trace_pc(void *priv, intptr_t pc)
+{
+	kcov_raw_t *raw;
+	uint64_t idx;
+
+	raw = (kcov_raw_t *)priv;
+
+	if (raw->mode != KCOV_MODE_TRACE_PC) {
+		/* PC tracing mode not enabled */
+		return;
+	}
+
+	idx = raw->buf[0];
+	if (idx < raw->bufnent) {
+		raw->buf[idx+1] = pc;
+		raw->buf[0] = idx + 1;
+	}
+}
+
+static void
+kcov_raw_cov_trace_cmp(void *priv, uint64_t type, uint64_t arg1, uint64_t arg2,
+    intptr_t pc)
+{
+	kcov_raw_t *raw;
+	uint64_t idx;
+
+	raw = (kcov_raw_t *)priv;
+
+	if (raw->mode != KCOV_MODE_TRACE_CMP) {
+		/* CMP tracing mode not enabled */
+		return;
+	}
+
+	idx = raw->buf[0];
+	if ((idx * 4 + 4) <= raw->bufnent) {
+		raw->buf[idx * 4 + 1] = type;
+		raw->buf[idx * 4 + 2] = arg1;
+		raw->buf[idx * 4 + 3] = arg2;
+		raw->buf[idx * 4 + 4] = pc;
+		raw->buf[0] = idx + 1;
+	}
+}
+
+static struct kcov_ops kcov_raw_ops = {
+	.open = kcov_raw_open,
+	.free = kcov_raw_free,
+	.setbufsize = kcov_raw_setbufsize,
+	.enable = kcov_raw_enable,
+	.disable = kcov_raw_disable,
+	.mmap = kcov_raw_mmap,
+	.cov_trace_pc = kcov_raw_cov_trace_pc,
+	.cov_trace_cmp = kcov_raw_cov_trace_cmp
+};

@@ -34,7 +34,10 @@
 
 #include <sys/param.h>
 #include <sys/types.h>
-#include <sys/atomic.h>
+
+#ifdef _KERNEL
+#include <uvm/uvm.h>
+#endif
 
 #define KCOV_IOC_SETBUFSIZE	_IOW('K', 1, uint64_t)
 #define KCOV_IOC_ENABLE		_IOW('K', 2, int)
@@ -46,5 +49,30 @@
 
 typedef volatile uint64_t kcov_int_t;
 #define KCOV_ENTRY_SIZE sizeof(kcov_int_t)
+
+#ifdef _KERNEL
+typedef void *(*kcov_open_func_t)(void);
+typedef void (*kcov_free_func_t)(void *);
+typedef int (*kcov_setbufsize_func_t)(void *, uint64_t);
+typedef int (*kcov_enable_func_t)(void *, int);
+typedef int (*kcov_disable_func_t)(void *);
+typedef int (*kcov_mmap_func_t)(void *, size_t, off_t, struct uvm_object **);
+typedef void (*kcov_cov_trace_pc_func_t)(void *, intptr_t);
+typedef void (*kcov_cov_trace_cmp_func_t)(void *, uint64_t, uint64_t, uint64_t, intptr_t);
+
+struct kcov_ops {
+	kcov_open_func_t open;
+	kcov_free_func_t free;
+	kcov_setbufsize_func_t setbufsize;
+	kcov_enable_func_t enable;
+	kcov_disable_func_t disable;
+	kcov_mmap_func_t mmap;
+	kcov_cov_trace_pc_func_t cov_trace_pc;
+	kcov_cov_trace_cmp_func_t cov_trace_cmp;
+};
+
+int kcov_ops_set(struct kcov_ops *);
+int kcov_ops_unset(struct kcov_ops *);
+#endif
 
 #endif /* !_SYS_KCOV_H_ */
